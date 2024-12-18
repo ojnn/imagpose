@@ -1,0 +1,5 @@
+wget -O ./weights/stable-diffusion-v1-5/v1-5-pruned.ckpt https://hf-mirror.com/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned.ckpt?download=true
+wget -O ./weights/stable-diffusion-v1-5/safety_checker/pytorch_model.bin https://hf-mirror.com/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/safety_checker/pytorch_model.bin?download=true
+wget -O ./weights/stable-diffusion-v1-5/text_encoder/pytorch_model.bin https://hf-mirror.com/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/text_encoder/pytorch_model.bin?download=true
+wget -O ./weights/stable-diffusion-v1-5/unet/diffusion_pytorch_model.bin https://hf-mirror.com/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/unet/diffusion_pytorch_model.bin?download=true
+wget -O ./weights/stable-diffusion-v1-5/vae/diffusion_pytorch_model.bin https://hf-mirror.com/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/vae/diffusion_pytorch_model.bin?download=true

@@ -34,7 +34,8 @@ from tqdm.auto import tqdm
 from diffusers.models.modeling_utils import ModelMixin
 from transformers import CLIPVisionModelWithProjection
 from transformers import Dinov2Model
-from pose_DeepFashion_dataset import HumanPoseDataset
+from pose_dataset import HumanPoseDataset
+from medical.brats import Brats
 # from models.mutual_self_attention import ReferenceAttentionControl
 from models.pose_guider import PoseGuider
 from models.unet_2d_condition import UNet2DConditionModel
@@ -70,15 +71,8 @@ class Net(nn.Module):
         self.pose_guider = pose_guider
         self.patch = patch
 
-    def forward( self, noisy_latents, timesteps, clip_image_embeds, pose_img, ref_latents):
-
-        pose_fea = self.pose_guider(pose_img) #[1, 320, 192, 128]
-
-        patch_ref_latents = self.patch(ref_latents) #bs, 4, 96, 64 - > bs, 24, 768
-
-        clip_vae_embeds = torch.cat([clip_image_embeds, patch_ref_latents], dim=1)  # bs, (257+24), 768
-
-        model_pred = self.denoising_unet(noisy_latents, timesteps, pose_cond_fea=pose_fea,encoder_hidden_states=clip_vae_embeds).sample
+    def forward(self, noisy_latents, timesteps):
+        model_pred = self.denoising_unet(noisy_latents, timesteps, encoder_hidden_states=None).sample
 
         return model_pred
 
@@ -263,13 +257,8 @@ def main(cfg):
         num_training_steps=cfg.solver.max_train_steps
         * cfg.solver.gradient_accumulation_steps,
     )
-
-    train_dataset = HumanPoseDataset(
-        width=cfg.data.train_width,
-        height=cfg.data.train_height,
-        img_scale=(1.0, 1.0),
-        json_file=cfg.data.json_file,
-    )
+    
+    train_dataset = Brats()
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=cfg.data.train_bs, shuffle=True, num_workers=4
     )
@@ -362,124 +351,98 @@ def main(cfg):
             t_data = time.time() - t_data_start
             with accelerator.accumulate(net):
                 # Convert videos to latent space
-                pixel_values_vid = batch["pixel_values_person"].to(weight_dtype) # b, c, 2h, 2w,
-                pixel_values_image_mask = batch["pixel_values_image_mask"].to(weight_dtype) # b, c, 2h, 2w,
-                vae_ref_img = batch["vae_ref_img"].to(weight_dtype)
-                with torch.no_grad():
+                _pixel_values_vid = batch["pixel_values_person"].to(weight_dtype) # b, c, 2h, 2w,
+                _pixel_values_image_mask = batch["pixel_values_image_mask"].to(weight_dtype) # b, c, 2h, 2w,
+                for i in range(_pixel_values_vid.shape[1]):
+                    pixel_values_vid = torch.unsqueeze(_pixel_values_vid[:,i,:,:], dim=1).repeat(1,3,1,1)
+                    pixel_values_image_mask = torch.unsqueeze(_pixel_values_image_mask[:,i,:,:], dim=1).repeat(1,3,1,1)
 
-                    latents = vae.encode(pixel_values_vid).latent_dist.sample() # b,4,2h/8,2w/8
-                    latents = latents * 0.18215
+                    with torch.no_grad():
 
-                    # Get the masked image latents: Image + black concatenation
-                    masked_latents = vae.encode(pixel_values_image_mask).latent_dist.sample()# b,4,2h/8,2w/8
-                    masked_latents = masked_latents * 0.18215
+                        latents = vae.encode(pixel_values_vid).latent_dist.sample() # b,4,2h/8,2w/8
+                        latents = latents * 0.18215
 
-                    # Get the ref image latents
-                    ref_latents = vae.encode(vae_ref_img).latent_dist.sample() # b,4,h/8, w/8
-                    ref_latents = ref_latents * 0.18215
+                        # Get the masked image latents: Image + black concatenation
+                        masked_latents = vae.encode(pixel_values_image_mask).latent_dist.sample()# b,4,2h/8,2w/8
+                        masked_latents = masked_latents * 0.18215
 
-                noise = torch.randn_like(latents)
-                if cfg.noise_offset > 0:
-                    noise += cfg.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1],  1, 1),
+                    noise = torch.randn_like(latents)
+                    if cfg.noise_offset > 0:
+                        noise += cfg.noise_offset * torch.randn(
+                            (latents.shape[0], latents.shape[1],  1, 1),
+                            device=latents.device,
+                        )
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each video
+                    timesteps = torch.randint(
+                        0,
+                        train_noise_scheduler.num_train_timesteps,
+                        (bsz,),
                         device=latents.device,
                     )
-                bsz = latents.shape[0]
-                # Sample a random timestep for each video
-                timesteps = torch.randint(
-                    0,
-                    train_noise_scheduler.num_train_timesteps,
-                    (bsz,),
-                    device=latents.device,
-                )
-                timesteps = timesteps.long()
+                    timesteps = timesteps.long()
 
-                pixel_values_pose = batch["pixel_values_pose"].to(device="cuda", dtype=weight_dtype)  # (bs, c, H, W)
-
-                uncond_fwd = random.random() < cfg.uncond_ratio
-                clip_image_list = []
-
-                for batch_idx, (clip_img) in enumerate (batch["clip_ref_img"]):
-                    if uncond_fwd:
-                        clip_image_list.append(torch.zeros_like(clip_img))
+                    # add noise
+                    noisy_latents = train_noise_scheduler.add_noise(latents, noise, timesteps)
+                    # 9 channel input
+                    pixel_values_flag_label = batch["pixel_values_flag_label"].to(accelerator.device,dtype=weight_dtype)  # b, c, f, 2h/8, 2w/8,
+                    noisy_latents = torch.cat([noisy_latents, pixel_values_flag_label, masked_latents], dim=1)
+                    # Get the target for loss depending on the prediction type
+                    if train_noise_scheduler.prediction_type == "epsilon":
+                        target = noise
+                    elif train_noise_scheduler.prediction_type == "v_prediction":
+                        target = train_noise_scheduler.get_velocity(
+                            latents, noise, timesteps
+                        )
                     else:
-                        clip_image_list.append(clip_img)
+                        raise ValueError(
+                            f"Unknown prediction type {train_noise_scheduler.prediction_type}"
+                        )
 
-
-                with torch.no_grad():
-
-                    clip_img = torch.stack(clip_image_list, dim=0).to(
-                        dtype=image_enc.dtype, device=image_enc.device
-                    )
-                    clip_img = clip_img.to(device="cuda", dtype=weight_dtype)
-                    clip_image_embeds = image_enc(
-                        clip_img.to("cuda", dtype=weight_dtype)
-                    ).last_hidden_state  # (bs, 257, d)
-
-                # add noise
-                noisy_latents = train_noise_scheduler.add_noise(latents, noise, timesteps)
-                # 9 channel input
-                pixel_values_flag_label = batch["pixel_values_flag_label"].to(accelerator.device,dtype=weight_dtype)  # b, c, f, 2h/8, 2w/8,
-                noisy_latents = torch.cat([noisy_latents, pixel_values_flag_label, masked_latents], dim=1)
-                # Get the target for loss depending on the prediction type
-                if train_noise_scheduler.prediction_type == "epsilon":
-                    target = noise
-                elif train_noise_scheduler.prediction_type == "v_prediction":
-                    target = train_noise_scheduler.get_velocity(
-                        latents, noise, timesteps
-                    )
-                else:
-                    raise ValueError(
-                        f"Unknown prediction type {train_noise_scheduler.prediction_type}"
+                    # ---- Forward!!! -----
+                    model_pred = net(
+                        noisy_latents,
+                        timesteps,
                     )
 
-                # ---- Forward!!! -----
-                model_pred = net(
-                    noisy_latents,
-                    timesteps,
-                    clip_image_embeds,
-                    pixel_values_pose,
-                    ref_latents,
-                )
+                    if cfg.snr_gamma == 0:
+                        loss = F.mse_loss(
+                            model_pred.float(), target.float(), reduction="mean"
+                        )
+                    else:
+                        snr = compute_snr(train_noise_scheduler, timesteps)
+                        if train_noise_scheduler.config.prediction_type == "v_prediction":
+                            # Velocity objective requires that we add one to SNR values before we divide by them.
+                            snr = snr + 1
+                        mse_loss_weights = (
+                            torch.stack(
+                                [snr, cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
+                            ).min(dim=1)[0]
+                            / snr
+                        )
+                        loss = F.mse_loss(
+                            model_pred.float(), target.float(), reduction="none"
+                        )
+                        loss = (
+                            loss.mean(dim=list(range(1, len(loss.shape))))
+                            * mse_loss_weights
+                        )
+                        loss = loss.mean()
+                        
+                    # Gather the losses across all processes for logging (if we use distributed training).
+                    avg_loss = accelerator.gather(loss.repeat(cfg.data.train_bs)).mean()
+                    train_loss += avg_loss.item() / cfg.solver.gradient_accumulation_steps
 
-                if cfg.snr_gamma == 0:
-                    loss = F.mse_loss(
-                        model_pred.float(), target.float(), reduction="mean"
-                    )
-                else:
-                    snr = compute_snr(train_noise_scheduler, timesteps)
-                    if train_noise_scheduler.config.prediction_type == "v_prediction":
-                        # Velocity objective requires that we add one to SNR values before we divide by them.
-                        snr = snr + 1
-                    mse_loss_weights = (
-                        torch.stack(
-                            [snr, cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
-                        ).min(dim=1)[0]
-                        / snr
-                    )
-                    loss = F.mse_loss(
-                        model_pred.float(), target.float(), reduction="none"
-                    )
-                    loss = (
-                        loss.mean(dim=list(range(1, len(loss.shape))))
-                        * mse_loss_weights
-                    )
-                    loss = loss.mean()
-
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(cfg.data.train_bs)).mean()
-                train_loss += avg_loss.item() / cfg.solver.gradient_accumulation_steps
-
-                # Backpropagate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        trainable_params,
-                        cfg.solver.max_grad_norm,
-                    )
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    # Backpropagate
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(
+                            trainable_params,
+                            cfg.solver.max_grad_norm,
+                        )
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)

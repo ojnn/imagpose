@@ -26,6 +26,7 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from pose_dataset import HumanPoseDataset
+from medical.brats import Brats
 # from models.mutual_self_attention import ReferenceAttentionControl
 from models.pose_guider import PoseGuider
 # from models.unet_2d_condition import UNet2DConditionModel
@@ -55,25 +56,18 @@ class PatchEmbedding(ModelMixin):
         return x.flatten(2).transpose(1, 2)  # (B, N, E)
 
 class Net(nn.Module):
-    def __init__( self, denoising_unet: UNet3DConditionModel, pose_guider: PoseGuider, patch : PatchEmbedding):
+    def __init__( self, denoising_unet: UNet3DConditionModel, pose_guider: PoseGuider, patch,):
         super().__init__()
 
         self.denoising_unet = denoising_unet
         self.pose_guider = pose_guider
-
         self.patch = patch
 
-    def forward( self, noisy_latents, timesteps, clip_image_embeds, pose_img, ref_latents):
-
-        pose_fea = self.pose_guider(pose_img) #[1, 320, 192, 128]
-
-        patch_ref_latents = self.patch(ref_latents) #bs, 4, 96, 64 - > bs, 24, 768
-
-        clip_vae_embeds = torch.cat([clip_image_embeds, patch_ref_latents], dim=1)  # bs, (257+24), 768
-
-        model_pred = self.denoising_unet(noisy_latents, timesteps,pose_cond_fea=pose_fea,encoder_hidden_states=clip_vae_embeds).sample
+    def forward(self, noisy_latents, timesteps):
+        model_pred = self.denoising_unet(noisy_latents, timesteps, encoder_hidden_states=None).sample
 
         return model_pred
+
 
 
 def compute_snr(noise_scheduler, timesteps):
